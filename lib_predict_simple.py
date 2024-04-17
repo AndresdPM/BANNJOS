@@ -5,6 +5,7 @@ Libraries module for predict_simple.py
 import sys, os
 import numpy as np
 import pandas as pd
+import polars as pl
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -146,41 +147,98 @@ def dropout(n_inputs, n_outputs, n_instances, params):
     return model_mc
 
 
-def get_statistics(preds, targets_names, index = None):
+def get_statistics(preds, targets_names, full_cov, pool = None, index = None):
 
     from astropy.stats import sigma_clip, sigma_clipped_stats, mad_std
     from sklearn.mixture import GaussianMixture
 
-    clipped_pred = np.ma.filled(sigma_clip(preds, axis = 0, sigma=6, maxiters=10))
+    # The format of preds is (n_iterations, n_objects, n_features)
 
-    mc_median = np.nanpercentile(clipped_pred, 50.0, axis=0)
-    std = mad_std(clipped_pred, axis = 0)
-    errd = mc_median - np.nanpercentile(clipped_pred, 15.865, axis=0)
-    erru = np.nanpercentile(clipped_pred, 84.135, axis=0) - mc_median
-    errdd = mc_median - np.nanpercentile(clipped_pred, 2.275, axis=0)
-    erruu = np.nanpercentile(clipped_pred, 97.725, axis=0) - mc_median
+    clipped_pred = np.ma.filled(sigma_clip(preds, axis = 0, sigma = 6, stdfunc='mad_std', maxiters=10), np.nan)
 
-    mat = np.array([[(np.sqrt(3)+3)/6, -np.sqrt((2-np.sqrt(3))/6), -1/np.sqrt(3)],
-    [-np.sqrt((2-np.sqrt(3))/6), (np.sqrt(3)+3)/6, -1/np.sqrt(3)],
-    [1/np.sqrt(3), 1/np.sqrt(3), 1/np.sqrt(3)]])
+    # Standard statistics
+    pc = np.nanpercentile(clipped_pred, [2.275, 15.865, 50.0, 84.135, 97.725], axis=0)
+    std = mad_std(clipped_pred, axis = 0, ignore_nan=True)
+    mean = np.nanmean(clipped_pred, axis = 0)
 
-    rot_preds = np.dot(preds, mat.T)
+    # The correlations have to be obtained in a loop
+    triu_indices = np.triu_indices(len(targets_names), k = 1)
+    correlation_names = [targets_names[ii]+'_'+targets_names[jj]+'_corr' for (ii, jj) in zip(triu_indices[0], triu_indices[1])]
 
-    gmm_n_comp = 3
-    gm = GaussianMixture(n_components=gmm_n_comp)
-
-    rot_covariances = np.ones((preds.shape[1], (preds.shape[2]-1)**2 * gmm_n_comp))*99
-    rot_means = np.ones((preds.shape[1], (preds.shape[2]-1) * gmm_n_comp))*99
-    rot_weights = np.ones((preds.shape[1], gmm_n_comp))*99
-
-    for ii, rot_pred in enumerate(rot_preds.swapaxes(0,1)):
+    correlation_tf = tfp.stats.correlation(preds, sample_axis=0, event_axis=-1, keepdims=False, name=None).numpy()
+    correlation = np.ones((preds.shape[1], len(correlation_names)))*-99
+    for ii, corr in enumerate(correlation_tf):
         cli_progress_test(ii+1, preds.shape[1])
-        gm.fit(rot_pred[:,0:2])
-        rot_covariances[ii,:] = gm.covariances_.flatten()
-        rot_means[ii,:] = gm.means_.flatten()
-        rot_weights[ii,:] = gm.weights_.flatten()
+        correlation[ii, :] = corr[triu_indices]
+    del [correlation_tf]
 
-    results = pd.DataFrame(columns=[target+'_pc50' for target in targets_names]+[target+'_pc16' for target in targets_names]+[target+'_pc84' for target in targets_names]+[target+'_pc02' for target in targets_names]+[target+'_pc98' for target in targets_names]+[target+'_error' for target in targets_names]+['comp%i_cov_%i%i'%(comp, ii, jj) for comp in [1,2,3] for ii in [1,2] for jj in [1,2]]+['comp%i_mean_%i'%(comp, ii) for comp in [1,2,3] for ii in [1,2]]+['comp%i_weight'%(comp) for comp in [1,2,3]], data = np.hstack([mc_median, errd, erru, errdd, erruu, std, rot_covariances, rot_means, rot_weights]), index = index)
+    results = pd.DataFrame(columns=[target+'_mean' for target in targets_names]+[target+'_std' for target in targets_names]+correlation_names+[target+'_pc02' for target in targets_names]+[target+'_pc16' for target in targets_names]+[target+'_pc50' for target in targets_names]+[target+'_pc84' for target in targets_names]+[target+'_pc98' for target in targets_names], data = np.hstack([mean, std, correlation, pc[0], pc[1], pc[2], pc[3], pc[4]]), index = index)
+
+    if full_cov:
+        print('')
+        print('Fitting the GMM...')
+        # Number of components for the GMM
+        gmm_n_comp = len(targets_names)
+
+        triu_indices = np.triu_indices(preds.shape[2]-1, k = 0)
+        rot_covariances_names = ['comp%i_cov_%i%i'%(comp+1, ii+1, jj+1) for comp in range(gmm_n_comp) for (ii, jj) in zip(triu_indices[0], triu_indices[1])]
+        rot_means_names = ['comp%i_mean_%i'%(comp+1, ii+1) for comp in range(gmm_n_comp) for ii in range(preds.shape[2]-1)]
+        rot_weights_names = ['comp%i_weight'%(comp+1) for comp in range(gmm_n_comp)]
+
+        rot_covariances = np.ones((preds.shape[1], len(rot_covariances_names)))*-99
+        rot_means = np.ones((preds.shape[1], len(rot_means_names)))*-99
+        rot_weights = np.ones((preds.shape[1], len(rot_weights_names)))*-99
+
+        # We perform the entire GMM compression
+        mat = np.array([[(np.sqrt(3)+3)/6, -np.sqrt((2-np.sqrt(3))/6), -1/np.sqrt(3)],
+        [-np.sqrt((2-np.sqrt(3))/6), (np.sqrt(3)+3)/6, -1/np.sqrt(3)],
+        [1/np.sqrt(3), 1/np.sqrt(3), 1/np.sqrt(3)]])
+
+        rot_preds = np.dot(preds, mat.T)
+
+        gmm = GaussianMixture(n_components=gmm_n_comp, init_params = 'k-means++')
+
+        # Parallelize GMM
+        args_gmm = []
+        for pred_chunk, index_chunk in zip(np.array_split(rot_preds.swapaxes(0,1), pool._processes), np.array_split(index, pool._processes)):
+            args_gmm.append((gmm, pred_chunk, index_chunk))
+
+        results = results.join(pd.concat(pool.map(launch_gmm_predictions, args_gmm)))
+        del [gmm]
+
+    return results
+
+
+def launch_gmm_predictions(args):
+    """
+    This routine pipes into multiple threads.
+    """
+    return gmm_prediction(*args)
+
+
+def gmm_prediction(gmm, data, index):
+    """
+    This routine fits a multi gaussian mixture model into data and returns the parameters of such fit
+    """
+    gmm_n_comp = gmm.n_components
+    triu_indices = np.triu_indices(data.shape[2]-1, k = 0)
+
+    covariances_names = ['comp%i_cov_%i%i'%(comp+1, ii+1, jj+1) for comp in range(gmm_n_comp) for (ii, jj) in zip(triu_indices[0], triu_indices[1])]
+    means_names = ['comp%i_mean_%i'%(comp+1, ii+1) for comp in range(gmm_n_comp) for ii in range(data.shape[2]-1)]
+    weights_names = ['comp%i_weight'%(comp+1) for comp in range(gmm_n_comp)]
+
+    covariances = np.ones((data.shape[0], len(covariances_names)))*-99
+    means = np.ones((data.shape[0], len(means_names)))*-99
+    weights = np.ones((data.shape[0], len(weights_names)))*-99
+
+    for ii, obj in enumerate(data):
+        cli_progress_test(ii+1, data.shape[0])
+        gmm.fit(obj[:,0:2])
+        covariances[ii,:] = np.concatenate([cov[triu_indices] for cov in gmm.covariances_])
+        means[ii,:] = gmm.means_.flatten()
+        weights[ii,:] = gmm.weights_.flatten()
+
+    results = pd.DataFrame(columns=covariances_names+means_names+weights_names, data = np.hstack([covariances, means, weights]), index = index)
 
     return results
 
@@ -210,7 +268,7 @@ def predict(params, X, X_error = None, built_model = None, idxs_pred = None, n_c
 
             y_pred = np.concatenate(pool.map(launch_make_predictions, args_prediction), axis = 1)
 
-            results = get_statistics(y_pred, params['targets_names'], index = X.index)
+            results = get_statistics(y_pred, params['targets_names'], params['full_cov'], pool = pool, index = X.index)
 
             if idxs_pred is not None:
                 y_pred_sel = y_pred[:, [idx for idx in idxs_pred if idx < np.shape(y_pred)[1]], :]
@@ -222,12 +280,11 @@ def predict(params, X, X_error = None, built_model = None, idxs_pred = None, n_c
             y_pred_sel = []
             results = []
             for ii, (indices_total, X_i, X_error_i) in enumerate(zip(np.array_split(range(X.shape[0]), n_chunks), np.array_split(X, n_chunks), np.array_split(X_error, n_chunks))):
-                print('\n')
                 print('Predicting %i of %i'%(ii+1, n_chunks))
 
                 y_pred_i = make_predictions(params, X_i, X_error_i, built_model)
 
-                results.append(get_statistics(y_pred_i, params['targets_names'], index = X_i.index))
+                results.append(get_statistics(y_pred_i, params['targets_names'], params['full_cov'], pool = Pool(int(cpu_count()/2)), index = X_i.index))
 
                 if idxs_pred is not None:
                     indices = np.where(np.in1d(indices_total, [idx for idx in idxs_pred if idx < np.shape(X)[0]]))[0]
@@ -243,7 +300,7 @@ def predict(params, X, X_error = None, built_model = None, idxs_pred = None, n_c
     else:
         print('Running prediction single processor mode.')
         y_pred = make_predictions(params, X, X_error, built_model)
-        results = get_statistics(y_pred, params['targets_names'], index = X.index)
+        results = get_statistics(y_pred, params['targets_names'], params['full_cov'], pool = Pool(int(cpu_count()/2)), index = X.index)
         y_pred_sel = y_pred[:, [idx for idx in idxs_pred if idx < np.shape(y_pred)[1]], :]
 
         del [y_pred]
@@ -279,6 +336,7 @@ def make_predictions(params, X, eX = None, built_model = None, process = None):
     rng_val = default_rng(process)
 
     iterate = int(params['alleatoric_n_iter'])
+
     preds =np.zeros((iterate, X.shape[0], params['pre_trained_n_outputs']))
 
     if params['alleatoric_montecarlo']:
@@ -293,7 +351,7 @@ def make_predictions(params, X, eX = None, built_model = None, process = None):
     return preds
 
 
-def get_data_test(params, external_cat = None):
+def get_data_test(params, dtypes = None, external_cat = None):
 
     def rel2abs(var, var_relerr):
         return pd.DataFrame(data = var_relerr.values * var.values, columns = ['%s_error'%col.replace('relerr_', '').replace('_relerr', '').replace('relerr', '') for col in var_relerr.columns], index = var_relerr.index)
@@ -354,9 +412,12 @@ def get_data_test(params, external_cat = None):
         if used_photo=='flux_aper_3_0':
             photo = [mag for mag in data.columns if 'flux_aper_3_0_' in mag]
             photo_err = [flux for flux in data.columns if 'flux_relerr_aper_3_0_' in flux]
+        if used_photo=='fnu_flux_aper':
+            photo = [mag for mag in data.columns if 'fnu_flux_aper_' in mag]
+            photo_err = [flux for flux in data.columns if 'fnu_flux_relerr_aper_' in flux]
         if used_photo=='flux_aper':
-            photo = [mag for mag in data.columns if 'flux_aper_' in mag]
-            photo_err = [flux for flux in data.columns if 'flux_relerr_aper_' in flux]
+            photo = [mag for mag in data.columns if (('flux_aper_' in mag) and ('_flux_aper_' not in mag)) ]
+            photo_err = [flux for flux in data.columns if (('flux_relerr_aper_' in flux) and ('_flux_relerr_aper_' not in flux))]
         if used_photo=='mag_aper':
             photo = [mag for mag in data.columns if 'mag_aper_' in mag]
             photo_err = [flux for flux in data.columns if 'mag_err_aper_' in flux]
@@ -373,7 +434,8 @@ def get_data_test(params, external_cat = None):
     X_vars, y_vars, y_vars_err, prediction_vars = params['X_vars'], params['y_vars'], params['y_vars_err'], params['prediction_vars']
 
     # Read data
-    predict_data = pd.read_csv(params['test_catalog'])
+    #predict_data = pd.read_csv(params['test_catalog'])
+    predict_data = pl.read_csv(params['test_catalog'], dtypes = dtypes).to_pandas()
 
     print('We have read %i lines.'%len(predict_data))
 
@@ -424,13 +486,24 @@ def get_data_test(params, external_cat = None):
     if (params['photo_log']) & ('flux' in params['used_photo']):
         # We transform the fluxes to logarithm
         predict_data.loc[:, photo_err] = (predict_data.loc[:, photo_err].values)/((predict_data.loc[:, photo].values)*np.log(10))
-        predict_data.loc[:, photo] = np.log10(predict_data.loc[:, photo]+2e3)
-
+        predict_data.loc[:, photo] = np.log10(predict_data.loc[:, photo] - params['fluxes_zpt'])
         try:
             predict_data.loc[:, [ 'e_fg','e_fbp','e_frp']] = (predict_data.loc[:, [ 'e_fg','e_fbp','e_frp']].values)/((predict_data.loc[:, [ 'fg','fbp','frp']].values)*np.log(10))
-            predict_data.loc[:, [ 'fg','fbp','frp']] = np.log10(predict_data.loc[:, [ 'fg','fbp','frp']]+2e3)
+            predict_data.loc[:, [ 'fg','fbp','frp']] = np.log10(predict_data.loc[:, [ 'fg','fbp','frp']] - params['fluxes_zpt'])
         except:
             pass
+
+    # We are going to add new colors that help with QSO detection
+    import itertools
+    photo_colors = [mag for mag in predict_data.columns if 'magab_mag_aper_4' in mag]+['w1mpropm_cw', 'w2mpropm_cw']
+
+    # We transform the missing magnitudes to nans
+    predict_data.loc[:, photo_colors] = predict_data.loc[:, photo_colors].apply(lambda x: np.where(x == 99.0, np.nan, x)).values
+
+    color_combs = list(itertools.combinations(photo_colors, 2))
+    for color_comb in color_combs:
+        predict_data['%s-%s'%(color_comb[0], color_comb[1])] = predict_data.loc[:, '%s'%color_comb[0]].values - predict_data.loc[:, '%s'%color_comb[1]].values
+        X_vars += ['%s-%s'%(color_comb[0], color_comb[1])]
 
     # We select the data
     predict_X = predict_data.loc[:, X_vars]
