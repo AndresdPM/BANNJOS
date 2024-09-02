@@ -32,7 +32,8 @@
 
 2. Install the required packages:
 
-pip install -r requirements.txt
+   ```bash
+   pip install -r requirements.txt
 
 
 3. Prepare your data and place it in the appropriate directories as expected by the code.
@@ -41,10 +42,12 @@ pip install -r requirements.txt
 
 # Basic Command
 
+   ```bash
 python BANNJOS_train.py --experiment_name "YourExperiment"
 
 # Example Command
 
+```bash
 python BANNJOS_train.py --experiment_name "Classify" --model_nominal "dropout"
 python BANNJOS_train.py --experiment_name "Classify" --model_nominal "deterministic" --layers_nominal 300 100 50
 
@@ -63,6 +66,7 @@ python BANNJOS_train.py --experiment_name "Classify" --model_nominal "determinis
 
 For a full list of arguments and their descriptions, refer to the code or use the --help option:
 
+```bash
 python BANNJOS_train.py --help
 
 ## Output
