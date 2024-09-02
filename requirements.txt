@@ -1,0 +1,12 @@
+pandas
+polars
+numpy
+scikit-learn
+imbalanced-learn
+tensorflow
+tensorflow-probability
+matplotlib
+seaborn
+scipy
+astropy
+uncertainties
